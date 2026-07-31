@@ -1,0 +1,58 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+**/xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+timeline.xctimeline
+playground.xcworkspace
+
+# Archives / export scratch
+*.xcarchive/
+export/
+Dist/
+
+# CMake / C++ intermediate builds (keep lib/libVitalEngine.a)
+cpp/build/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+.build/
+
+# CocoaPods / Carthage (if added later)
+Pods/
+Carthage/Build/
+
+# Secrets / signing material
+*.p12
+*.mobileprovision
+*.cer
+*.certSigningRequest
+AuthKey_*.p8
+.env
+.env.*
+Secrets.xcconfig
+
+# Editor / tooling
+.idea/
+.vscode/
+*.swp
+*~
+.cursor/
+agent-transcripts/
