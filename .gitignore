@@ -56,3 +56,4 @@ Secrets.xcconfig
 *~
 .cursor/
 agent-transcripts/
+ExportOptions.plist
