@@ -34,8 +34,8 @@ jobs:
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -r build/Vital.xcarchive/Products/Applications/*.app Payload/
-          zip -r Vital-Synth-Mod.ipa Payload
+          cp -R build/Vital.xcarchive/Products/Applications/*.app Payload/
+          /usr/bin/ditto -c -k --sequesterRsrc Payload Vital-Synth-Mod.ipa
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
