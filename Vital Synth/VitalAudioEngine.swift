@@ -2001,7 +2001,7 @@ final class VitalAudioEngine: ObservableObject {
         let name = url.deletingPathExtension().lastPathComponent
 
         loadQueue.async { [weak self] in
-            let ok = w.loadSample(fromData: data, sampleRate: sampleRate)
+            let ok = w.loadSample(from: data, sampleRate: sampleRate)
             if ok {
                 DispatchQueue.main.async {
                     self?.sampleName = name
