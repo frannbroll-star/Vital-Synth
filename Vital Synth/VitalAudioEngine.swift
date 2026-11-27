@@ -100,6 +100,8 @@ final class VitalAudioEngine: ObservableObject {
     @Published var sampleKeytrack: Bool = false
     /// Downsampled preview of the loaded sample for the SMP waveform viewer.
     @Published var sampleDisplayFrames: [Float] = []
+    /// File name of the audio imported into the sampler (empty = none imported).
+    @Published var sampleName: String = ""
 
     // MARK: Filters — model: Analog/Dirty/Ladder/Digital/Diode/Formant/Comb/Phaser (0-7)
     static let filterModelNames = ["Analog", "Dirty", "Ladder", "Digital", "Diode", "Formant", "Comb", "Phaser"]
@@ -201,6 +203,23 @@ final class VitalAudioEngine: ObservableObject {
     @Published var compressorMix: Float = 1.0
     @Published var compressorAttack: Float = 0.5
     @Published var compressorRelease: Float = 0.5
+    /// 0 = Multiband, 1 = Low Band, 2 = High Band, 3 = Single Band (compressor_enabled_bands).
+    @Published var compressorBands: Int = 0
+    /// Raw engine values for every per-band control, keyed by the Vital parameter name
+    /// (e.g. "compressor_low_upper_threshold"). Defaults = Vital's own defaults.
+    @Published var compressorParams: [String: Float] = VitalAudioEngine.compressorDefaults
+
+    static let compressorBandIDs = ["low", "band", "high"]
+    static let compressorDefaults: [String: Float] = [
+        "compressor_low_upper_threshold": -28, "compressor_band_upper_threshold": -25, "compressor_high_upper_threshold": -30,
+        "compressor_low_lower_threshold": -35, "compressor_band_lower_threshold": -36, "compressor_high_lower_threshold": -35,
+        "compressor_low_upper_ratio": 0.9,  "compressor_band_upper_ratio": 0.857, "compressor_high_upper_ratio": 1.0,
+        "compressor_low_lower_ratio": 0.8,  "compressor_band_lower_ratio": 0.8,   "compressor_high_lower_ratio": 0.8,
+        "compressor_low_gain": 16.3, "compressor_band_gain": 11.7, "compressor_high_gain": 16.3
+    ]
+
+    // MARK: Oversampling (0 = 1x, 1 = 2x, 2 = 4x, 3 = 8x) — Vital default is 2x
+    @Published var oversampling: Int = 1
 
     // MARK: FX — Delay
     @Published var delayOn: Bool = false
@@ -257,6 +276,41 @@ final class VitalAudioEngine: ObservableObject {
     @Published var pitchBendRange: Float = 2.0        // 0-48
 
     @Published var masterVolume: Float = 0.8601       // maps to raw ≈5473 → ≈ -6 dB
+
+    // MARK: Oscillator advanced + TUNE (index 0…2 = OSC 1…3)
+    /// TUNE as 0-1 knob position → osc_N_tune -1…1 (written via VitalEngineWrapper.setTune).
+    @Published var oscTune: [Float] = [0.5, 0.5, 0.5]
+    @Published var oscUnisonBlend: [Float] = [0.8, 0.8, 0.8]     // osc_N_unison_blend 0-1
+    @Published var oscStereoSpread: [Float] = [1, 1, 1]          // osc_N_stereo_spread 0-1
+    @Published var oscDetuneRange: [Float] = [2, 2, 2]           // osc_N_detune_range, semitones 0-48
+    @Published var oscStackStyle: [Int] = [0, 0, 0]              // osc_N_stack_style
+    static let stackStyleNames = [
+        "NORMAL", "DROP 12", "DROP 24", "OCTAVE", "2 OCT",
+        "POWER", "MAJOR", "MINOR", "HARM", "ODD"
+    ]
+
+    // MARK: Tempo-synced rates (LFO tempo, delay tempo)
+    static let tempoNames = [
+        "32/1", "16/1", "8/1", "4/1", "2/1", "1/1",
+        "1/2", "1/4", "1/8", "1/16", "1/32", "1/64"
+    ]
+    @Published var lfoTempos: [Int] = Array(repeating: 8, count: 8)   // lfo_N_tempo
+    @Published var delayTempo: Int = 9                                 // delay_tempo
+    @Published var delayAuxTempo: Int = 9                              // delay_aux_tempo
+
+    // MARK: Extra FX controls
+    @Published var flangerFrequency: Float = 0.2857   // 0-1 → -5..2
+    @Published var phaserFrequency: Float = 0.2857    // 0-1 → -5..2
+    /// 0 = Off, 1 = Pre, 2 = Post (distortion_filter_order)
+    @Published var distortionFilterOrder: Int = 0
+    static let distortionFilterOrderNames = ["OFF", "PRE", "POST"]
+    @Published var distortionFilterCutoff: Float = 0.5625   // 0-1 → MIDI 8..136
+    @Published var distortionFilterResonance: Float = 0.2
+    @Published var distortionFilterBlend: Float = 0.0       // 0-1 → 0..2
+
+    // MARK: Filter keytrack (0-1 knob → -1…1)
+    @Published var filter1Keytrack: Float = 0.5
+    @Published var filter2Keytrack: Float = 0.5
 
     // MARK: Modulation matrix
     @Published var modConnections: [ModConnection] = []
@@ -805,6 +859,20 @@ final class VitalAudioEngine: ObservableObject {
         compressorRelease = v
         setParameter("compressor_release", v)
     }
+    func setCompressorBands(_ v: Int) {
+        compressorBands = min(max(v, 0), 3)
+        setParameter("compressor_enabled_bands", Float(compressorBands))
+    }
+    /// Sets one raw per-band compressor parameter (threshold dB, ratio, gain dB).
+    func setCompressorParam(_ name: String, _ v: Float) {
+        compressorParams[name] = v
+        setParameter(name, v)
+    }
+    func setOversampling(_ v: Int) {
+        oversampling = min(max(v, 0), 3)
+        // The wrapper calls checkOversampling() when this parameter changes.
+        setParameter("oversampling", Float(oversampling))
+    }
 
     func setDelayOn(_ v: Bool) {
         delayOn = v
@@ -994,9 +1062,8 @@ final class VitalAudioEngine: ObservableObject {
 
     func setLegato(_ v: Bool) {
         legato = v
+        // Legato is independent of polyphony (as in desktop Vital).
         setParameter("legato", v ? 1 : 0)
-        // Preserve existing UI behaviour: legato forces mono; leaving restores polyphony.
-        setParameter("polyphony", v ? 1 : Float(polyphony))
     }
     func setGlide(_ v: Float) {
         glide = v
@@ -1006,9 +1073,7 @@ final class VitalAudioEngine: ObservableObject {
     func setPolyphony(_ v: Int) {
         let c = min(max(v, 1), 32)
         polyphony = c
-        if !legato {
-            setParameter("polyphony", Float(c))
-        }
+        setParameter("polyphony", Float(c))
     }
     func setPitchBendRange(_ v: Float) {
         pitchBendRange = min(max(v, 0), 48)
@@ -1019,6 +1084,139 @@ final class VitalAudioEngine: ObservableObject {
         masterVolume = v
         // Vital's volume is in linear amplitude squared * 7399, approx
         setParameter("volume", v * v * 7399.44)
+    }
+
+    // MARK: - Oscillator advanced / TUNE setters
+
+    private static func oscKey(_ osc: Int, _ suffix: String) -> String {
+        "osc_\(osc + 1)_\(suffix)"
+    }
+
+    /// TUNE: knob 0-1 → osc_N_tune -1…1, written through the wrapper's typed API.
+    func setOscTune(_ osc: Int, _ v: Float) {
+        guard (0..<3).contains(osc) else { return }
+        let c = min(max(v, 0), 1)
+        oscTune[osc] = c
+        wrapper?.setTune(c * 2 - 1, forOscillator: Int32(osc))
+    }
+
+    /// Reads osc_1…3_tune back from the engine into the published knob positions.
+    func refreshOscTuneFromEngine() {
+        guard let w = wrapper else { return }
+        for i in 0..<3 {
+            let raw = w.tune(forOscillator: Int32(i))
+            oscTune[i] = min(max((raw + 1) / 2, 0), 1)
+        }
+    }
+
+    func setOscUnisonBlend(_ osc: Int, _ v: Float) {
+        guard (0..<3).contains(osc) else { return }
+        oscUnisonBlend[osc] = min(max(v, 0), 1)
+        setParameter(Self.oscKey(osc, "unison_blend"), oscUnisonBlend[osc])
+    }
+    func setOscStereoSpread(_ osc: Int, _ v: Float) {
+        guard (0..<3).contains(osc) else { return }
+        oscStereoSpread[osc] = min(max(v, 0), 1)
+        setParameter(Self.oscKey(osc, "stereo_spread"), oscStereoSpread[osc])
+    }
+    func setOscDetuneRange(_ osc: Int, _ semitones: Float) {
+        guard (0..<3).contains(osc) else { return }
+        oscDetuneRange[osc] = min(max(semitones, 0), 48)
+        setParameter(Self.oscKey(osc, "detune_range"), oscDetuneRange[osc])
+    }
+    func setOscStackStyle(_ osc: Int, _ v: Int) {
+        guard (0..<3).contains(osc) else { return }
+        oscStackStyle[osc] = min(max(v, 0), Self.stackStyleNames.count - 1)
+        setParameter(Self.oscKey(osc, "stack_style"), Float(oscStackStyle[osc]))
+    }
+
+    // MARK: - Tempo setters
+
+    func setLfoTempo(_ index: Int, _ v: Int) {
+        guard (0..<8).contains(index) else { return }
+        lfoTempos[index] = min(max(v, 0), Self.tempoNames.count - 1)
+        setParameter("lfo_\(index + 1)_tempo", Float(lfoTempos[index]))
+    }
+    func setDelayTempo(_ v: Int) {
+        delayTempo = min(max(v, 0), Self.tempoNames.count - 1)
+        setParameter("delay_tempo", Float(delayTempo))
+    }
+    func setDelayAuxTempo(_ v: Int) {
+        delayAuxTempo = min(max(v, 0), Self.tempoNames.count - 1)
+        setParameter("delay_aux_tempo", Float(delayAuxTempo))
+    }
+
+    // MARK: - Extra FX setters
+
+    func setFlangerFrequency(_ v: Float) {
+        flangerFrequency = v
+        setParameter("flanger_frequency", -5 + 7 * v)
+    }
+    func setPhaserFrequency(_ v: Float) {
+        phaserFrequency = v
+        setParameter("phaser_frequency", -5 + 7 * v)
+    }
+    func setDistortionFilterOrder(_ v: Int) {
+        distortionFilterOrder = min(max(v, 0), Self.distortionFilterOrderNames.count - 1)
+        setParameter("distortion_filter_order", Float(distortionFilterOrder))
+    }
+    func setDistortionFilterCutoff(_ v: Float) {
+        distortionFilterCutoff = v
+        setParameter("distortion_filter_cutoff", 8 + 128 * v)
+    }
+    func setDistortionFilterResonance(_ v: Float) {
+        distortionFilterResonance = v
+        setParameter("distortion_filter_resonance", v)
+    }
+    func setDistortionFilterBlend(_ v: Float) {
+        distortionFilterBlend = v
+        setParameter("distortion_filter_blend", v * 2.0)
+    }
+
+    // MARK: - Filter keytrack setters
+
+    func setFilter1Keytrack(_ v: Float) {
+        filter1Keytrack = v
+        setParameter("filter_1_keytrack", v * 2 - 1)
+    }
+    func setFilter2Keytrack(_ v: Float) {
+        filter2Keytrack = v
+        setParameter("filter_2_keytrack", v * 2 - 1)
+    }
+
+    /// Pushes every control added in this section to the engine (used on start / init).
+    private func syncExtendedPublishedToEngine() {
+        for i in 0..<3 {
+            setOscTune(i, oscTune[i])
+            setOscUnisonBlend(i, oscUnisonBlend[i])
+            setOscStereoSpread(i, oscStereoSpread[i])
+            setOscDetuneRange(i, oscDetuneRange[i])
+            setOscStackStyle(i, oscStackStyle[i])
+        }
+        for i in 0..<8 { setLfoTempo(i, lfoTempos[i]) }
+        setDelayTempo(delayTempo); setDelayAuxTempo(delayAuxTempo)
+        setFlangerFrequency(flangerFrequency); setPhaserFrequency(phaserFrequency)
+        setDistortionFilterOrder(distortionFilterOrder)
+        setDistortionFilterCutoff(distortionFilterCutoff)
+        setDistortionFilterResonance(distortionFilterResonance)
+        setDistortionFilterBlend(distortionFilterBlend)
+        setFilter1Keytrack(filter1Keytrack); setFilter2Keytrack(filter2Keytrack)
+    }
+
+    private func resetExtendedControls() {
+        for i in 0..<3 {
+            setOscTune(i, 0.5)
+            setOscUnisonBlend(i, 0.8)
+            setOscStereoSpread(i, 1)
+            setOscDetuneRange(i, 2)
+            setOscStackStyle(i, 0)
+        }
+        for i in 0..<8 { setLfoTempo(i, 8) }
+        setDelayTempo(9); setDelayAuxTempo(9)
+        setFlangerFrequency(0.2857); setPhaserFrequency(0.2857)
+        setDistortionFilterOrder(0); setDistortionFilterCutoff(0.5625)
+        setDistortionFilterResonance(0.2); setDistortionFilterBlend(0)
+        setFilter1Keytrack(0.5); setFilter2Keytrack(0.5)
     }
 
     // MARK: - Modulation matrix
@@ -1201,6 +1399,9 @@ final class VitalAudioEngine: ObservableObject {
         setChorusFeedback(chorusFeedback); setChorusModDepth(chorusModDepth); setChorusFrequency(chorusFrequency)
         setCompressorOn(compressorOn); setCompressorMix(compressorMix)
         setCompressorAttack(compressorAttack); setCompressorRelease(compressorRelease)
+        setCompressorBands(compressorBands)
+        for (k, v) in compressorParams { setCompressorParam(k, v) }
+        setOversampling(oversampling)
         setDelayOn(delayOn); setDelayMix(delayMix)
         setDelayFeedback(delayFeedback); setDelayFrequency(delayFrequency)
         setDistortionOn(distortionOn); setDistortionMix(distortionMix)
@@ -1219,6 +1420,8 @@ final class VitalAudioEngine: ObservableObject {
         setLegato(legato)
         setGlide(glide)
         setPitchBendRange(pitchBendRange)
+
+        syncExtendedPublishedToEngine()
     }
 
     // MARK: - Preset capture / apply
@@ -1314,6 +1517,9 @@ final class VitalAudioEngine: ObservableObject {
 
         setChorusOn(false); setChorusMix(0); setChorusFeedback(0.5); setChorusModDepth(0.5); setChorusFrequency(0.333)
         setCompressorOn(false); setCompressorMix(1); setCompressorAttack(0.5); setCompressorRelease(0.5)
+        setCompressorBands(0)
+        for (k, v) in Self.compressorDefaults { setCompressorParam(k, v) }
+        setOversampling(1)
         setDelayOn(false); setDelayMix(0); setDelayFeedback(0.5); setDelayFrequency(0.3636)
         setDistortionOn(false); setDistortionMix(0); setDistortionDrive(0.5); setDistortionType(0)
         setEqualizerOn(false); setEqualizerLowGain(0); setEqualizerMidGain(0); setEqualizerHighGain(0)
@@ -1326,6 +1532,8 @@ final class VitalAudioEngine: ObservableObject {
         setLegato(false)
         setGlide(0.0)
         setPitchBendRange(2.0)
+
+        resetExtendedControls()
     }
 
     func applyPreset(_ p: VitalPreset) {
@@ -1398,8 +1606,33 @@ final class VitalAudioEngine: ObservableObject {
             }
         }
 
+        // 4. Modulation matrix (settings.modulations) and LFO shapes (settings.lfos).
+        wrapper?.loadModulationsAndLFOs(fromPresetJSON: data)
+        ensureLfoPrewiring()
+        refreshOscTuneFromEngine()
+
         refreshSampleDisplay()
         refreshModulations()
+    }
+
+    /// The LFO panel drives `lfo_N → target` connections that are pre-created at amount 0.
+    /// Loading a preset replaces the matrix, so re-create any of those that are missing
+    /// (existing connections keep their preset amount).
+    private func ensureLfoPrewiring() {
+        guard let w = wrapper else { return }
+        var existing = Set<String>()
+        for anyDict in w.listModulations() {
+            guard let dict = anyDict as? [String: Any],
+                  let s = dict["source"] as? String,
+                  let d = dict["destination"] as? String else { continue }
+            existing.insert("\(s)|\(d)")
+        }
+        for lfoIdx in 1...8 {
+            let source = "lfo_\(lfoIdx)"
+            for t in Self.lfoTargets where !existing.contains("\(source)|\(t)") {
+                _ = w.connectModulation(source, to: t, amount: 0.0)
+            }
+        }
     }
 
     /// Maps Vital preset `settings` values back to @Published vars so the UI updates.
@@ -1538,6 +1771,9 @@ final class VitalAudioEngine: ObservableObject {
         compressorOn = b("compressor_on"); compressorMix = f("compressor_mix", 1)
         compressorAttack = f("compressor_attack", 0.5)
         compressorRelease = f("compressor_release", 0.5)
+        compressorBands = min(max(Int(f("compressor_enabled_bands", 0).rounded()), 0), 3)
+        for (k, def) in Self.compressorDefaults { compressorParams[k] = f(k, def) }
+        oversampling = min(max(Int(f("oversampling", 1).rounded()), 0), 3)
 
         delayOn = b("delay_on"); delayMix = f("delay_dry_wet")
         delayFeedback = (f("delay_feedback", 0.5) + 1) / 2
@@ -1570,6 +1806,35 @@ final class VitalAudioEngine: ObservableObject {
         reverbSize = f("reverb_size", 0.5)
         reverbDecay = (f("reverb_decay_time") + 6) / 12
         reverbChorusAmount = f("reverb_chorus_amount", 0.2236)
+
+        // Oscillator advanced (TUNE itself is re-read from the engine in loadVitalPreset)
+        for i in 0..<3 {
+            let n = i + 1
+            oscUnisonBlend[i] = f("osc_\(n)_unison_blend", 0.8)
+            oscStereoSpread[i] = f("osc_\(n)_stereo_spread", 1)
+            oscDetuneRange[i] = f("osc_\(n)_detune_range", 2)
+            oscStackStyle[i] = min(max(Int(f("osc_\(n)_stack_style").rounded()), 0), Self.stackStyleNames.count - 1)
+            oscTune[i] = min(max((f("osc_\(n)_tune") + 1) / 2, 0), 1)
+        }
+
+        // Tempo-synced rates
+        let maxTempo = Self.tempoNames.count - 1
+        for i in 0..<8 {
+            lfoTempos[i] = min(max(Int(f("lfo_\(i + 1)_tempo", 8).rounded()), 0), maxTempo)
+        }
+        delayTempo = min(max(Int(f("delay_tempo", 9).rounded()), 0), maxTempo)
+        delayAuxTempo = min(max(Int(f("delay_aux_tempo", 9).rounded()), 0), maxTempo)
+
+        // Extra FX + filter keytrack
+        flangerFrequency = min(max((f("flanger_frequency", -3) + 5) / 7, 0), 1)
+        phaserFrequency = min(max((f("phaser_frequency", -3) + 5) / 7, 0), 1)
+        distortionFilterOrder = min(max(Int(f("distortion_filter_order").rounded()), 0),
+                                    Self.distortionFilterOrderNames.count - 1)
+        distortionFilterCutoff = min(max((f("distortion_filter_cutoff", 80) - 8) / 128, 0), 1)
+        distortionFilterResonance = f("distortion_filter_resonance", 0.2)
+        distortionFilterBlend = min(max(f("distortion_filter_blend") / 2.0, 0), 1)
+        filter1Keytrack = min(max((f("filter_1_keytrack") + 1) / 2, 0), 1)
+        filter2Keytrack = min(max((f("filter_2_keytrack") + 1) / 2, 0), 1)
 
         // Voice
         polyphony = Int(f("polyphony", 16).rounded())
@@ -1701,6 +1966,48 @@ final class VitalAudioEngine: ObservableObject {
         }
         sampleDisplayFrames = data.withUnsafeBytes { ptr in
             Array(ptr.bindMemory(to: Float.self))
+        }
+    }
+
+    // MARK: - Sampler import (SMP)
+
+    /// Imports a .wav / .aiff (any format AVAudioFile can read) into the sampler.
+    /// Stereo files are mixed down to mono. Call while the security-scoped resource is open.
+    func loadSample(from url: URL) {
+        guard let w = wrapper else { return }
+        guard let audioFile = try? AVAudioFile(forReading: url) else { return }
+        let format = audioFile.processingFormat          // Float32, deinterleaved, file sample rate
+        let frameCount = AVAudioFrameCount(audioFile.length)
+        guard frameCount > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount),
+              (try? audioFile.read(into: buf)) != nil,
+              let ch = buf.floatChannelData else { return }
+
+        let n = Int(buf.frameLength)
+        let channels = Int(format.channelCount)
+        guard n > 0, channels > 0 else { return }
+        var mono = [Float](repeating: 0, count: n)
+        if channels == 1 {
+            mono = Array(UnsafeBufferPointer(start: ch[0], count: n))
+        } else {
+            let gain = 1 / Float(channels)
+            for c in 0..<channels {
+                let p = ch[c]
+                for i in 0..<n { mono[i] += p[i] * gain }
+            }
+        }
+        let data = mono.withUnsafeBufferPointer { Data(buffer: $0) }
+        let sampleRate = Int32(format.sampleRate.rounded())
+        let name = url.deletingPathExtension().lastPathComponent
+
+        loadQueue.async { [weak self] in
+            let ok = w.loadSample(fromData: data, sampleRate: sampleRate)
+            if ok {
+                DispatchQueue.main.async {
+                    self?.sampleName = name
+                    self?.refreshSampleDisplay()
+                }
+            }
         }
     }
 
