@@ -95,7 +95,7 @@ static bool vitalLoadSampleIntoEngine(vital::SoundEngine *engine,
                                       int sourceSampleRate, int playbackSampleRate) {
     vital::Sample *sample = engine->getSample();
     if (!sample) return false;
-    sample->loadSample(samples, count, sourceSampleRate, playbackSampleRate);
+    sample->loadSample(samples, count, sourceSampleRate);
     return true;
 }
 
