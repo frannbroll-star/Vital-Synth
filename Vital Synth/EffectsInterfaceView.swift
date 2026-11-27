@@ -271,6 +271,98 @@ struct EffectsInterfaceView: View {
         .opacity(isEnabled(fx) ? 1 : 0.72)
     }
 
+    // MARK: - Multiband compressor (Vital: compressor_*)
+
+    private static let compressorModeNames = ["MULTIBAND", "LOW", "HIGH", "SINGLE"]
+
+    /// Which bands are active for compressor_enabled_bands:
+    /// 0 Multiband = low+band+high · 1 Low = low+band · 2 High = band+high · 3 Single = band only.
+    private func compressorBandVisible(_ band: String) -> Bool {
+        switch engine.compressorBands {
+        case 1: return band != "high"
+        case 2: return band != "low"
+        case 3: return band == "band"
+        default: return true
+        }
+    }
+
+    private func compKnob(_ label: String, key: String, min lo: Float, max hi: Float, color: Color) -> some View {
+        VitalKnob(label: label, value: Binding(
+            get: { ((engine.compressorParams[key] ?? lo) - lo) / (hi - lo) },
+            set: { engine.setCompressorParam(key, lo + Swift.min(1, Swift.max(0, $0)) * (hi - lo)) }
+        ), size: 32, color: color)
+    }
+
+    @ViewBuilder
+    private func compressorBandColumn(_ band: String, title: String, color: Color) -> some View {
+        VStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 9, weight: .bold)).tracking(1.0)
+                .foregroundColor(VitalColors.bodyText)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+                .background(VitalColors.bodyHeading)
+                .cornerRadius(3)
+            HStack(spacing: 4) {
+                compKnob("UP TH", key: "compressor_\(band)_upper_threshold", min: -80, max: 0, color: color)
+                compKnob("UP RT", key: "compressor_\(band)_upper_ratio", min: 0, max: 1, color: color)
+            }
+            HStack(spacing: 4) {
+                compKnob("LO TH", key: "compressor_\(band)_lower_threshold", min: -80, max: 0, color: color)
+                compKnob("LO RT", key: "compressor_\(band)_lower_ratio", min: -1, max: 1, color: color)
+            }
+            compKnob("GAIN", key: "compressor_\(band)_gain", min: -30, max: 30, color: color)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private func compressorControls(_ fx: VitalEffectID) -> some View {
+        VStack(spacing: 12) {
+            // Mode: Multiband / Low band / High band / Single band
+            HStack(spacing: 3) {
+                Text("MODE")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(VitalColors.labelText)
+                    .padding(.trailing, 4)
+                ForEach(Array(Self.compressorModeNames.enumerated()), id: \.offset) { idx, name in
+                    Button { engine.setCompressorBands(idx) } label: {
+                        Text(name)
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(engine.compressorBands == idx ? .black : VitalColors.labelText)
+                            .padding(.horizontal, 8).padding(.vertical, 6)
+                            .background(engine.compressorBands == idx ? fx.color : VitalColors.bodyHeading)
+                            .cornerRadius(3)
+                    }.buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+
+            // Global controls
+            HStack(spacing: 0) {
+                VitalKnob(label: "MIX", value: Binding(get: { engine.compressorMix }, set: { engine.setCompressorMix($0) }), size: 40, color: fx.color)
+                Spacer(minLength: 8)
+                VitalKnob(label: "ATK", value: Binding(get: { engine.compressorAttack }, set: { engine.setCompressorAttack($0) }), size: 40, color: fx.color)
+                Spacer(minLength: 8)
+                VitalKnob(label: "REL", value: Binding(get: { engine.compressorRelease }, set: { engine.setCompressorRelease($0) }), size: 40, color: fx.color)
+                Spacer(minLength: 0)
+            }
+
+            // Per-band thresholds / ratios / gain
+            HStack(alignment: .top, spacing: 8) {
+                if compressorBandVisible("low") {
+                    compressorBandColumn("low", title: "LOW", color: fx.color)
+                }
+                if compressorBandVisible("band") {
+                    compressorBandColumn("band", title: engine.compressorBands == 3 ? "SINGLE" : "BAND", color: fx.color)
+                }
+                if compressorBandVisible("high") {
+                    compressorBandColumn("high", title: "HIGH", color: fx.color)
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private func knobs(for fx: VitalEffectID) -> some View {
         switch fx {
@@ -285,13 +377,7 @@ struct EffectsInterfaceView: View {
                 VitalKnob(label: "FREQ", value: Binding(get: { engine.chorusFrequency }, set: { engine.setChorusFrequency($0) }), size: 40, color: fx.color)
             }
         case .compressor:
-            HStack(spacing: 0) {
-                VitalKnob(label: "MIX", value: Binding(get: { engine.compressorMix }, set: { engine.setCompressorMix($0) }), size: 40, color: fx.color)
-                Spacer(minLength: 8)
-                VitalKnob(label: "ATK", value: Binding(get: { engine.compressorAttack }, set: { engine.setCompressorAttack($0) }), size: 40, color: fx.color)
-                Spacer(minLength: 8)
-                VitalKnob(label: "REL", value: Binding(get: { engine.compressorRelease }, set: { engine.setCompressorRelease($0) }), size: 40, color: fx.color)
-            }
+            compressorControls(fx)
         case .delay:
             HStack(spacing: 0) {
                 VitalKnob(label: "MIX", value: Binding(get: { engine.delayMix }, set: { engine.setDelayMix($0) }), size: 40, color: fx.color)
