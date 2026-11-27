@@ -470,6 +470,29 @@ private func sectionChrome<Content: View>(@ViewBuilder content: () -> Content) -
         .clipShape(RoundedRectangle(cornerRadius: 5))
 }
 
+/// Compact ◀ value ▶ stepper for tempo-synced rates (names come from the caller).
+private func tempoStepper(label: String, names: [String], value: Int, color: Color,
+                          onChange: @escaping (Int) -> Void) -> some View {
+    let maxIdx = max(0, names.count - 1)
+    let idx = min(max(value, 0), maxIdx)
+    return HStack(spacing: 0) {
+        VitalKnobLabel(label)
+        Button { onChange(max(0, idx - 1)) } label: {
+            Image(systemName: "chevron.left").font(.system(size: 8))
+                .foregroundColor(VitalColors.labelText).frame(width: 20, height: 22)
+        }.buttonStyle(.plain)
+        Text(names.isEmpty ? "" : names[idx])
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundColor(color)
+            .frame(minWidth: 34)
+        Button { onChange(min(maxIdx, idx + 1)) } label: {
+            Image(systemName: "chevron.right").font(.system(size: 8))
+                .foregroundColor(VitalColors.labelText).frame(width: 20, height: 22)
+        }.buttonStyle(.plain)
+    }
+    .background(VitalColors.widgetBg).cornerRadius(3)
+}
+
 // MARK: - Oscillator section (Vital columns)
 
 struct OscillatorSection: View {
@@ -492,6 +515,8 @@ struct OscillatorSection: View {
     var wavetableName: String = "Init"
     var knobSize: CGFloat = 28
     var onWavetableLoaded: ((URL) -> Void)? = nil
+    /// Engine-driven TUNE knob position (0-1). When nil the knob keeps a local value.
+    var tuneValue: Float? = nil
     var onTuneChanged: ((Float) -> Void)? = nil
     var onEditWavetable: (() -> Void)? = nil
 
@@ -502,6 +527,25 @@ struct OscillatorSection: View {
     @State private var dropStatus: String? = nil
 
     private var semitones: Int { Int((transpose * 96 - 48).rounded()) }
+
+    /// 1-based number of this oscillator, parsed from its title ("OSC 2" → 2).
+    private var oscNumber: Int { Int(title.filter(\.isNumber)) ?? 1 }
+
+    /// Distortion names with the real FM/RM modulator, mirroring
+    /// ProducersModule::getFirst/SecondModulationIndex:
+    /// OSC1 → A=OSC2, B=OSC3 · OSC2 → A=OSC1, B=OSC3 · OSC3 → A=OSC1, B=OSC2.
+    private var distortionNames: [String] {
+        let n = oscNumber - 1
+        let firstIdx = (n == 0) ? 1 : 0
+        let secondIdx = (n == 1) ? 2 : firstIdx + 1
+        let a = "OSC \(firstIdx + 1)"
+        let b = "OSC \(secondIdx + 1)"
+        return [
+            "NONE", "SYNC", "FORM", "QUANT", "BEND", "SQZ", "PULSE",
+            "FM <- \(a)", "FM <- \(b)", "FM <- SMP",
+            "RM <- \(a)", "RM <- \(b)", "RM <- SMP"
+        ]
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -657,7 +701,7 @@ struct OscillatorSection: View {
             .padding(.top, 8)
 
             VitalKnob(label: "TUNE", value: Binding(
-                get: { tune },
+                get: { tuneValue ?? tune },
                 set: { tune = $0; onTuneChanged?($0) }
             ), size: knobSize, color: VitalColors.accent)
                 .padding(.top, 8)
@@ -802,7 +846,7 @@ struct OscillatorSection: View {
                 .padding(.vertical, 5)
                 .background(VitalColors.bodyHeading)
 
-            typeBrowser(names: distortionTypeNames, selected: $distortionType, color: VitalColors.warmOrange)
+            typeBrowser(names: distortionNames, selected: $distortionType, color: VitalColors.warmOrange)
                 .padding(.top, 4)
             VitalKnob(label: "AMT", value: $distortionAmount, size: knobSize, color: VitalColors.warmOrange)
                 .padding(.top, 4)
@@ -824,7 +868,7 @@ struct OscillatorSection: View {
                 .foregroundColor(color)
                 .frame(maxWidth: .infinity)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.5)
             Button { selected.wrappedValue = min(names.count - 1, selected.wrappedValue + 1) } label: {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 8, weight: .bold))
@@ -946,6 +990,7 @@ private struct WavetableDropDelegate: DropDelegate {
 
 struct SampleSection: View {
     @ObservedObject var engine: VitalAudioEngine
+    @State private var showSamplePicker = false
 
     var body: some View {
         sectionChrome {
@@ -975,6 +1020,25 @@ struct SampleSection: View {
                     VitalKnob(label: "PAN", value: Binding(
                         get: { engine.samplePan }, set: { engine.setSamplePan($0) }
                     ), size: 36, color: VitalColors.accent)
+                    VStack(spacing: 3) {
+                        Button { showSamplePicker = true } label: {
+                            Text("LOAD")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(Color(white: 0.92))
+                                .padding(.horizontal, 8).padding(.vertical, 5)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color(white: 0.11))
+                                        .overlay(RoundedRectangle(cornerRadius: 2)
+                                            .stroke(Color.white.opacity(0.08), lineWidth: 1))
+                                )
+                        }.buttonStyle(.plain)
+                        Text(engine.sampleName.isEmpty ? "—" : engine.sampleName)
+                            .font(.system(size: 7))
+                            .foregroundColor(VitalColors.labelText)
+                            .lineLimit(1)
+                            .frame(width: 56)
+                    }
                     Button {
                         engine.setSampleLoop(!engine.sampleLoop)
                     } label: {
@@ -1010,6 +1074,16 @@ struct SampleSection: View {
             }
             .frame(height: 92)
         }
+        .fileImporter(
+            isPresented: $showSamplePicker,
+            allowedContentTypes: [.wav, .aiff, UTType(filenameExtension: "aif") ?? .aiff],
+            onCompletion: { result in
+                guard case .success(let url) = result else { return }
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                engine.loadSample(from: url)
+            }
+        )
     }
 }
 
@@ -1025,6 +1099,8 @@ struct FilterSection: View {
     @Binding var model: Int
     @Binding var blend: Float
     var knobSize: CGFloat = 32
+    /// Optional KEYTRACK knob (0-1 → filter_N_keytrack -1…1).
+    var keytrack: Binding<Float>? = nil
 
     var body: some View {
         sectionChrome {
@@ -1065,6 +1141,10 @@ struct FilterSection: View {
                         VitalKnob(label: "DRIVE", value: $drive, size: knobSize, color: accentColor)
                         Spacer(minLength: 6)
                         VitalKnob(label: "BLEND", value: $blend, size: knobSize, color: accentColor)
+                        if let keytrack {
+                            Spacer(minLength: 6)
+                            VitalKnob(label: "KEYTRK", value: keytrack, size: knobSize, color: accentColor)
+                        }
                         Spacer(minLength: 0)
                     }
                     .padding(.horizontal, 4)
@@ -1145,7 +1225,32 @@ struct ModulationSidePanel: View {
         }
     }
 
+    /// Vital's real envelope ranges: attack/decay/release raw 0…2.37842 (time = raw⁴ s,
+    /// i.e. up to ~32 s), hold raw 0…1.41421. Knobs stay normalised 0…1.
+    private static let envTimeMax: Float = 2.37842
+    private static let envHoldMax: Float = 1.4142135
+
     private func envStages(_ i: Int) -> (
+        attack: Binding<Float>, hold: Binding<Float>,
+        decay: Binding<Float>, sustain: Binding<Float>, release: Binding<Float>
+    ) {
+        let raw = envStagesRaw(i)
+        func scaled(_ b: Binding<Float>, _ maxValue: Float) -> Binding<Float> {
+            Binding(
+                get: { min(1, max(0, b.wrappedValue / maxValue)) },
+                set: { b.wrappedValue = min(1, max(0, $0)) * maxValue }
+            )
+        }
+        return (
+            scaled(raw.attack, Self.envTimeMax),
+            scaled(raw.hold, Self.envHoldMax),
+            scaled(raw.decay, Self.envTimeMax),
+            raw.sustain,
+            scaled(raw.release, Self.envTimeMax)
+        )
+    }
+
+    private func envStagesRaw(_ i: Int) -> (
         attack: Binding<Float>, hold: Binding<Float>,
         decay: Binding<Float>, sustain: Binding<Float>, release: Binding<Float>
     ) {
@@ -1314,6 +1419,7 @@ struct ModulationSidePanel: View {
                             }
                         }
                     }
+                    lfoTempoRow
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 2) {
                             ForEach(Array(VitalAudioEngine.lfoTargetNames.enumerated()), id: \.offset) { idx, name in
@@ -1330,6 +1436,20 @@ struct ModulationSidePanel: View {
                     }
                 }
                 .padding(8)
+            }
+        }
+    }
+
+    /// lfo_N_tempo — only meaningful when the LFO is in a tempo mode (TEMPO / DOT / TRIP).
+    @ViewBuilder
+    private var lfoTempoRow: some View {
+        let sync = engine.lfoSyncs[safe: lfoTab] ?? 1
+        if sync >= 1 && sync <= 3 {
+            HStack(spacing: 0) {
+                tempoStepper(label: "TEMPO", names: VitalAudioEngine.tempoNames,
+                             value: engine.lfoTempos[safe: lfoTab] ?? 8,
+                             color: VitalColors.modTeal) { engine.setLfoTempo(lfoTab, $0) }
+                Spacer(minLength: 0)
             }
         }
     }
@@ -1454,12 +1574,21 @@ struct AdvancedTab: View {
                             set: { engine.setPitchBendRange($0 * 48) }
                         ), size: 34, color: VitalColors.warmOrange)
 
-                        VStack(spacing: 2) {
+                        VStack(spacing: 4) {
                             Text("OVERSAMPLE")
                                 .font(.system(size: 8)).foregroundColor(VitalColors.labelText)
-                            Text("1×")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundColor(VitalColors.accentDim)
+                            HStack(spacing: 2) {
+                                ForEach(Array(["1×", "2×", "4×", "8×"].enumerated()), id: \.offset) { idx, label in
+                                    Button { engine.setOversampling(idx) } label: {
+                                        Text(label)
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundColor(engine.oversampling == idx ? .black : VitalColors.labelText)
+                                            .frame(width: 30, height: 24)
+                                            .background(engine.oversampling == idx ? VitalColors.accent : VitalColors.bodyHeading)
+                                            .cornerRadius(3)
+                                    }.buttonStyle(.plain)
+                                }
+                            }
                         }
                         Spacer()
                     }
@@ -1474,7 +1603,8 @@ struct AdvancedTab: View {
     }
 
     private func oscAdvanced(_ n: Int) -> some View {
-        sectionChrome {
+        let i = n - 1
+        return sectionChrome {
             VStack(spacing: 0) {
                 Text("OSC \(n) ADVANCED")
                     .font(.system(size: 10, weight: .bold)).tracking(1.2)
@@ -1482,43 +1612,80 @@ struct AdvancedTab: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10).padding(.vertical, 7)
                     .background(VitalColors.bodyHeading)
-                HStack(spacing: 16) {
-                    VitalKnob(label: "DETUNE PWR", value: Binding(
-                        get: {
-                            switch n {
-                            case 2: return engine.osc2DetunePower
-                            case 3: return engine.osc3DetunePower
-                            default: return engine.osc1DetunePower
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 16) {
+                        VitalKnob(label: "DETUNE PWR", value: Binding(
+                            get: {
+                                switch n {
+                                case 2: return engine.osc2DetunePower
+                                case 3: return engine.osc3DetunePower
+                                default: return engine.osc1DetunePower
+                                }
+                            },
+                            set: {
+                                switch n {
+                                case 2: engine.setOsc2DetunePower($0)
+                                case 3: engine.setOsc3DetunePower($0)
+                                default: engine.setOsc1DetunePower($0)
+                                }
                             }
-                        },
-                        set: {
-                            switch n {
-                            case 2: engine.setOsc2DetunePower($0)
-                            case 3: engine.setOsc3DetunePower($0)
-                            default: engine.setOsc1DetunePower($0)
+                        ), size: 34, color: VitalColors.accent)
+                        VitalKnob(label: "RND PHASE", value: Binding(
+                            get: {
+                                switch n {
+                                case 2: return engine.osc2RandomPhase
+                                case 3: return engine.osc3RandomPhase
+                                default: return engine.osc1RandomPhase
+                                }
+                            },
+                            set: {
+                                switch n {
+                                case 2: engine.setOsc2RandomPhase($0)
+                                case 3: engine.setOsc3RandomPhase($0)
+                                default: engine.setOsc1RandomPhase($0)
+                                }
                             }
-                        }
-                    ), size: 34, color: VitalColors.accent)
-                    VitalKnob(label: "RND PHASE", value: Binding(
-                        get: {
-                            switch n {
-                            case 2: return engine.osc2RandomPhase
-                            case 3: return engine.osc3RandomPhase
-                            default: return engine.osc1RandomPhase
-                            }
-                        },
-                        set: {
-                            switch n {
-                            case 2: engine.setOsc2RandomPhase($0)
-                            case 3: engine.setOsc3RandomPhase($0)
-                            default: engine.setOsc1RandomPhase($0)
-                            }
-                        }
-                    ), size: 34, color: VitalColors.modTeal)
-                    Spacer()
+                        ), size: 34, color: VitalColors.modTeal)
+                        VitalKnob(label: "UNI BLEND", value: Binding(
+                            get: { engine.oscUnisonBlend[i] },
+                            set: { engine.setOscUnisonBlend(i, $0) }
+                        ), size: 34, color: VitalColors.accent)
+                        VitalKnob(label: "ST SPREAD", value: Binding(
+                            get: { engine.oscStereoSpread[i] },
+                            set: { engine.setOscStereoSpread(i, $0) }
+                        ), size: 34, color: VitalColors.accent)
+                        VitalKnob(label: "DET RANGE", value: Binding(
+                            get: { engine.oscDetuneRange[i] / 48 },
+                            set: { engine.setOscDetuneRange(i, $0 * 48) }
+                        ), size: 34, color: VitalColors.accent)
+                        stackStylePicker(i)
+                    }
+                    .padding(12)
                 }
-                .padding(12)
             }
+        }
+    }
+
+    private func stackStylePicker(_ i: Int) -> some View {
+        let names = VitalAudioEngine.stackStyleNames
+        let cur = min(max(engine.oscStackStyle[i], 0), names.count - 1)
+        return VStack(spacing: 4) {
+            VitalKnobLabel("STACK")
+            HStack(spacing: 0) {
+                Button { engine.setOscStackStyle(i, cur - 1) } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 8))
+                        .foregroundColor(VitalColors.labelText).frame(width: 20, height: 24)
+                }.buttonStyle(.plain)
+                Text(names[cur])
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(VitalColors.accent)
+                    .frame(minWidth: 52)
+                Button { engine.setOscStackStyle(i, cur + 1) } label: {
+                    Image(systemName: "chevron.right").font(.system(size: 8))
+                        .foregroundColor(VitalColors.labelText).frame(width: 20, height: 24)
+                }.buttonStyle(.plain)
+            }
+            .background(VitalColors.widgetBg).cornerRadius(3)
         }
     }
 }
@@ -1718,7 +1885,7 @@ struct ContentView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 5) {
                         if selectedTab == 1 {
-                            EffectsInterfaceView(engine: engine)
+                            effectsStack
                         } else if selectedTab == 2 {
                             MatrixInterfaceView(engine: engine)
                         } else {
@@ -1731,7 +1898,7 @@ struct ContentView: View {
             } else {
                 Group {
                     if selectedTab == 1 {
-                        EffectsInterfaceView(engine: engine)
+                        effectsStack
                             .padding(5)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if selectedTab == 2 {
@@ -1828,7 +1995,8 @@ struct ContentView: View {
                     resonance: Binding(get: { engine.filterResonance }, set: { engine.setFilterResonance($0) }),
                     drive: Binding(get: { engine.filterDrive }, set: { engine.setFilterDrive($0) }),
                     model: Binding(get: { engine.filterModel }, set: { engine.setFilterModel($0) }),
-                    blend: Binding(get: { engine.filter1Blend }, set: { engine.setFilter1Blend($0) })
+                    blend: Binding(get: { engine.filter1Blend }, set: { engine.setFilter1Blend($0) }),
+                    keytrack: Binding(get: { engine.filter1Keytrack }, set: { engine.setFilter1Keytrack($0) })
                 )
                 FilterSection(
                     filterNumber: 2, accentColor: VitalColors.warmOrange,
@@ -1838,7 +2006,8 @@ struct ContentView: View {
                     resonance: Binding(get: { engine.filter2Resonance }, set: { engine.setFilter2Resonance($0) }),
                     drive: Binding(get: { engine.filter2Drive }, set: { engine.setFilter2Drive($0) }),
                     model: Binding(get: { engine.filter2Model }, set: { engine.setFilter2Model($0) }),
-                    blend: Binding(get: { engine.filter2Blend }, set: { engine.setFilter2Blend($0) })
+                    blend: Binding(get: { engine.filter2Blend }, set: { engine.setFilter2Blend($0) }),
+                    keytrack: Binding(get: { engine.filter2Keytrack }, set: { engine.setFilter2Keytrack($0) })
                 )
             }
         }
@@ -1867,7 +2036,8 @@ struct ContentView: View {
                 displayFrames: engine.osc2DisplayFrames,
                 wavetableName: engine.osc2WavetableName,
                 onWavetableLoaded: { engine.loadWavetable(from: $0, oscillatorIndex: 1) },
-                onTuneChanged: { engine.setParameter("osc_2_tune", $0 * 2 - 1) },
+                tuneValue: engine.oscTune[1],
+                onTuneChanged: { engine.setOscTune(1, $0) },
                 onEditWavetable: { editingOscillator = 1 }
             ))
         case 3:
@@ -1891,7 +2061,8 @@ struct ContentView: View {
                 displayFrames: engine.osc3DisplayFrames,
                 wavetableName: engine.osc3WavetableName,
                 onWavetableLoaded: { engine.loadWavetable(from: $0, oscillatorIndex: 2) },
-                onTuneChanged: { engine.setParameter("osc_3_tune", $0 * 2 - 1) },
+                tuneValue: engine.oscTune[2],
+                onTuneChanged: { engine.setOscTune(2, $0) },
                 onEditWavetable: { editingOscillator = 2 }
             ))
         default:
@@ -1915,7 +2086,8 @@ struct ContentView: View {
                 displayFrames: engine.osc1DisplayFrames,
                 wavetableName: engine.osc1WavetableName,
                 onWavetableLoaded: { engine.loadWavetable(from: $0, oscillatorIndex: 0) },
-                onTuneChanged: { engine.setParameter("osc_1_tune", $0 * 2 - 1) },
+                tuneValue: engine.oscTune[0],
+                onTuneChanged: { engine.setOscTune(0, $0) },
                 onEditWavetable: { editingOscillator = 0 }
             ))
         }
@@ -1924,7 +2096,15 @@ struct ContentView: View {
     // MARK: EFFECTS
 
     private var effectsTab: some View {
-        EffectsInterfaceView(engine: engine)
+        effectsStack
+    }
+
+    /// Existing effects UI + the extra tempo / frequency / distortion-filter panel.
+    private var effectsStack: some View {
+        VStack(spacing: 5) {
+            EffectsInterfaceView(engine: engine)
+            EffectsExtraPanel(engine: engine)
+        }
     }
 
     private var keyboardHandle: some View {
@@ -1944,6 +2124,101 @@ struct ContentView: View {
                     keyboardHeight = max(40, min(110, keyboardHeight - v.translation.height))
                 }
         )
+    }
+}
+
+// MARK: - Extra FX panel (tempo / frequency / distortion filter)
+
+struct EffectsExtraPanel: View {
+    @ObservedObject var engine: VitalAudioEngine
+
+    var body: some View {
+        sectionChrome {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 0) {
+                    delayBlock
+                    Divider().background(Color.white.opacity(0.08))
+                    modulationFxBlock
+                    Divider().background(Color.white.opacity(0.08))
+                    distortionFilterBlock
+                }
+            }
+        }
+    }
+
+    private func header(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .bold)).tracking(1.0)
+            .foregroundColor(color)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(VitalColors.bodyHeading)
+    }
+
+    private var delayBlock: some View {
+        VStack(spacing: 0) {
+            header("DELAY TEMPO", color: VitalColors.fxDelay)
+            VStack(spacing: 6) {
+                tempoStepper(label: "MAIN", names: VitalAudioEngine.tempoNames,
+                             value: engine.delayTempo, color: VitalColors.fxDelay) {
+                    engine.setDelayTempo($0)
+                }
+                tempoStepper(label: "AUX", names: VitalAudioEngine.tempoNames,
+                             value: engine.delayAuxTempo, color: VitalColors.fxDelay) {
+                    engine.setDelayAuxTempo($0)
+                }
+            }
+            .padding(8)
+        }
+        .frame(width: 150)
+    }
+
+    private var modulationFxBlock: some View {
+        VStack(spacing: 0) {
+            header("FLANGER / PHASER", color: VitalColors.fxFlanger)
+            HStack(spacing: 14) {
+                VitalKnob(label: "FLG FREQ", value: Binding(
+                    get: { engine.flangerFrequency }, set: { engine.setFlangerFrequency($0) }
+                ), size: 34, color: VitalColors.fxFlanger)
+                VitalKnob(label: "PHS FREQ", value: Binding(
+                    get: { engine.phaserFrequency }, set: { engine.setPhaserFrequency($0) }
+                ), size: 34, color: VitalColors.fxPhaser)
+            }
+            .padding(8)
+        }
+        .frame(width: 140)
+    }
+
+    private var distortionFilterBlock: some View {
+        VStack(spacing: 0) {
+            header("DISTORTION FILTER", color: VitalColors.fxDistortion)
+            HStack(spacing: 12) {
+                VStack(spacing: 2) {
+                    ForEach(Array(VitalAudioEngine.distortionFilterOrderNames.enumerated()), id: \.offset) { idx, name in
+                        Button { engine.setDistortionFilterOrder(idx) } label: {
+                            Text(name)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(engine.distortionFilterOrder == idx ? .black : VitalColors.labelText)
+                                .frame(width: 38, height: 18)
+                                .background(engine.distortionFilterOrder == idx ? VitalColors.fxDistortion : VitalColors.bodyHeading)
+                                .cornerRadius(2)
+                        }.buttonStyle(.plain)
+                    }
+                }
+                VitalKnob(label: "CUTOFF", value: Binding(
+                    get: { engine.distortionFilterCutoff }, set: { engine.setDistortionFilterCutoff($0) }
+                ), size: 34, color: VitalColors.fxDistortion)
+                VitalKnob(label: "RES", value: Binding(
+                    get: { engine.distortionFilterResonance }, set: { engine.setDistortionFilterResonance($0) }
+                ), size: 34, color: VitalColors.fxDistortion)
+                VitalKnob(label: "BLEND", value: Binding(
+                    get: { engine.distortionFilterBlend }, set: { engine.setDistortionFilterBlend($0) }
+                ), size: 34, color: VitalColors.fxDistortion)
+            }
+            .padding(8)
+            .opacity(engine.distortionFilterOrder == 0 ? 0.55 : 1)
+        }
+        .frame(width: 260)
     }
 }
 
