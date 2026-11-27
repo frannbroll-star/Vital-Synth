@@ -38,8 +38,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// The value is the raw internal float value (matching Vital's parameter range).
 - (void)setParameter:(NSString *)name value:(float)value;
 
+/// Re-read the "oversampling" control (0=1x, 1=2x, 2=4x, 3=8x) and reconfigure the
+/// engine if it changed. setParameter:"oversampling" already calls this.
+- (void)checkOversampling;
+
 /// Return the current value of a named parameter.
 - (float)getParameter:(NSString *)name;
+
+/// TUNE of oscillator 0…2 (`osc_1_tune`, `osc_2_tune`, `osc_3_tune`).
+/// Raw Vital value; writes are clamped to the parameter's own range.
+/// Equivalent to get/setParameter with the matching name, but index-validated.
+- (float)tuneForOscillator:(int)oscIndex;
+- (void)setTune:(float)tune forOscillator:(int)oscIndex;
 
 /// Load a default sinusoidal wavetable into all oscillators.
 - (void)loadDefaultWavetables;
@@ -201,6 +211,36 @@ NS_ASSUME_NONNULL_BEGIN
                            to:(int)toFrame
                          mode:(int)mode
                   oscillator:(int)oscIndex;
+
+// MARK: - Preset modulations / LFOs (.vital `settings`)
+
+/// Replace the modulation matrix with `settings.modulations` of a .vital preset.
+/// `jsonData` may be the whole .vital file or just its `settings` object.
+/// Existing connections are removed first (only if the preset has a
+/// "modulations" array). Per-slot amount / bipolar / stereo / bypass / power
+/// are read from `modulation_N_*` in `settings`.
+/// Returns the number of connections created, or -1 if the JSON is invalid.
+- (NSInteger)loadModulationsFromPresetJSON:(NSData *)jsonData;
+
+/// Load `settings.lfos` (LineGenerator state of LFO 1…8) from a .vital preset.
+/// Returns the number of LFOs loaded, or -1 if the JSON is invalid.
+- (NSInteger)loadLFOsFromPresetJSON:(NSData *)jsonData;
+
+/// Convenience: parse once, then load LFOs followed by modulations.
+/// Call after the preset's plain parameters have been applied.
+/// Returns YES if the JSON was valid.
+- (BOOL)loadModulationsAndLFOsFromPresetJSON:(NSData *)jsonData;
+
+// MARK: - Sampler (SMP)
+
+/// Load a mono float32 buffer (e.g. decoded from WAV/AIF, [-1, 1]) into the
+/// sampler. `sampleRate` is the buffer's own rate. Returns YES on success.
+- (BOOL)loadSampleFromSamples:(const float *)samples
+                  sampleCount:(int)sampleCount
+                   sampleRate:(int)sampleRate;
+
+/// Same as above, taking tightly-packed mono float32 bytes.
+- (BOOL)loadSampleFromData:(NSData *)floatData sampleRate:(int)sampleRate;
 
 @end
 
