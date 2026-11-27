@@ -28,6 +28,8 @@
 #include <complex>
 #include <cmath>
 #include <algorithm>
+#include <utility>
+#include <cstring>
 
 // poly_float::kSize is 4; stereo is indices 0 (L) and 1 (R)
 static constexpr int kPolySize = vital::poly_float::kSize;
@@ -48,6 +50,53 @@ static NSMutableArray<NSData *> *vitalCaptureDisplayFrames(const float *samples,
         [arr addObject:[NSData dataWithBytes:disp length:kDisplaySamples * sizeof(float)]];
     }
     return arr;
+}
+
+// ─── Preset / sampler / tune helpers ─────────────────────────────────────────
+
+/// Parse a .vital file (or a bare `settings` object) and return its settings.
+static bool vitalParsePresetSettings(NSData *data, json &settings) {
+    if (!data || data.length == 0) return false;
+    try {
+        std::string s((const char *)data.bytes, data.length);
+        json root = json::parse(s);
+        if (!root.is_object()) return false;
+        auto it = root.find("settings");
+        if (it != root.end() && it->is_object())
+            settings = std::move(*it);
+        else
+            settings = std::move(root);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool vitalJsonHasKey(json &obj, const std::string &key) {
+    return obj.count(key) > 0;
+}
+
+static float vitalJsonFloat(json &obj, const std::string &key, float fallback) {
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_number()) return fallback;
+    return it->get<float>();
+}
+
+static const char *vitalTuneParamName(int oscIndex) {
+    static const char *kNames[3] = { "osc_1_tune", "osc_2_tune", "osc_3_tune" };
+    return (oscIndex >= 0 && oscIndex < 3) ? kNames[oscIndex] : nullptr;
+}
+
+/// Single point of contact with vital::Sample's loading API.
+/// If your copy of sample_source.h declares a different signature, adapt ONLY
+/// this function. Caller holds _lock and guarantees valid arguments.
+static bool vitalLoadSampleIntoEngine(vital::SoundEngine *engine,
+                                      const float *samples, int count,
+                                      int sourceSampleRate, int playbackSampleRate) {
+    vital::Sample *sample = engine->getSample();
+    if (!sample) return false;
+    sample->loadSample(samples, count, sourceSampleRate, playbackSampleRate);
+    return true;
 }
 
 @implementation VitalEngineWrapper {
@@ -110,6 +159,9 @@ static NSMutableArray<NSData *> *vitalCaptureDisplayFrames(const float *samples,
     [self _setRaw:"pitch_bend_range" value:2.0f];
 
     [self loadDefaultWavetables];
+
+    // Apply the default "oversampling" control (2x) like the desktop build does.
+    _engine->checkOversampling();
 
     return self;
 }
@@ -206,6 +258,15 @@ static NSMutableArray<NSData *> *vitalCaptureDisplayFrames(const float *samples,
 - (void)setParameter:(NSString *)name value:(float)value {
     std::lock_guard<std::mutex> lock(_lock);
     [self _setRaw:name.UTF8String value:value];
+    // The engine only picks up a new oversampling factor when told to
+    // (SynthBase does this on the message thread in the desktop build).
+    if ([name isEqualToString:@"oversampling"])
+        _engine->checkOversampling();
+}
+
+- (void)checkOversampling {
+    std::lock_guard<std::mutex> lock(_lock);
+    _engine->checkOversampling();
 }
 
 - (float)getParameter:(NSString *)name {
@@ -213,6 +274,26 @@ static NSMutableArray<NSData *> *vitalCaptureDisplayFrames(const float *samples,
     if (it != _controls.end())
         return it->second->value();
     return 0.0f;
+}
+
+// ─── Oscillator TUNE (osc_1_tune … osc_3_tune) ───────────────────────────────
+
+- (float)tuneForOscillator:(int)oscIndex {
+    const char *name = vitalTuneParamName(oscIndex);
+    if (!name) return 0.0f;
+    auto it = _controls.find(std::string(name));
+    if (it == _controls.end()) return 0.0f;
+    return (float)it->second->value();
+}
+
+- (void)setTune:(float)tune forOscillator:(int)oscIndex {
+    const char *name = vitalTuneParamName(oscIndex);
+    if (!name || !std::isfinite(tune)) return;
+    const std::string key(name);
+    const auto &details = vital::Parameters::getDetails(key);
+    float v = std::max((float)details.min, std::min((float)details.max, tune));
+    std::lock_guard<std::mutex> lock(_lock);
+    [self _setRaw:name value:v];
 }
 
 // ─── Wavetable loading helpers ────────────────────────────────────────────────
@@ -327,6 +408,23 @@ static bool vitalLoadFrames(vital::Wavetable *wt, const float *samples, int coun
 
 // ─── Modulation routing ──────────────────────────────────────────────────────
 
+/// Number of OTHER audio-rate connections that share `source` (mirrors
+/// SynthBase::createModulationChange). Needed so disconnecting one destination
+/// doesn't force a still-audio-rate source back to control rate.
+static int vitalCountOtherAudioRateConnections(vital::ModulationConnectionBank& bank,
+                                               const std::string& source,
+                                               const std::string& destination) {
+    int count = 0;
+    for (int i = 0; i < vital::kMaxModulationConnections; ++i) {
+        vital::ModulationConnection* other = bank.atIndex(i);
+        if (other->source_name == source &&
+            other->destination_name != destination &&
+            !other->modulation_processor->isControlRate())
+            ++count;
+    }
+    return count;
+}
+
 - (BOOL)connectModulation:(NSString *)source to:(NSString *)destination amount:(float)amount {
     std::lock_guard<std::mutex> lock(_lock);
     std::string src = source.UTF8String;
@@ -340,25 +438,34 @@ static bool vitalLoadFrames(vital::Wavetable *wt, const float *samples, int coun
         return YES;
     }
 
-    vital::ModulationConnectionBank& bank = _engine->getModulationBank();
-    vital::ModulationConnection* connection = bank.createConnection(src, dst);
-    if (!connection) return NO;
-
+    // Validate BEFORE touching the bank: createConnection() claims a slot, and
+    // getParameterRange asserts on unknown destinations.
     vital::modulation_change change;
-    change.source                = _engine->getModulationSource(src);
-    change.mono_destination      = _engine->getMonoModulationDestination(dst);
-    change.mono_modulation_switch= _engine->getMonoModulationSwitch(dst);
-
-    // Validate BEFORE calling getParameterRange — it asserts on unknown destinations.
+    change.source                 = _engine->getModulationSource(src);
+    change.mono_destination       = _engine->getMonoModulationDestination(dst);
+    change.mono_modulation_switch = _engine->getMonoModulationSwitch(dst);
     if (!change.source || !change.mono_destination || !change.mono_modulation_switch)
         return NO;
 
-    change.poly_modulation_switch= _engine->getPolyModulationSwitch(dst);
-    change.poly_destination      = _engine->getPolyModulationDestination(dst);
-    change.destination_scale     = vital::Parameters::getParameterRange(dst);
-    change.modulation_processor  = connection->modulation_processor.get();
-    change.disconnecting         = false;
-    change.num_audio_rate        = 0;
+    vital::ModulationConnectionBank& bank = _engine->getModulationBank();
+    vital::ModulationConnection* connection = bank.createConnection(src, dst);
+    if (!connection) return NO;   // bank full
+
+    change.poly_modulation_switch = _engine->getPolyModulationSwitch(dst);
+    change.poly_destination       = _engine->getPolyModulationDestination(dst);
+    change.destination_scale      = vital::Parameters::getParameterRange(dst);
+    change.modulation_processor   = connection->modulation_processor.get();
+    change.disconnecting          = false;
+
+    // Same guard as SynthBase::isInvalidConnection: release the slot and bail.
+    if (change.poly_destination &&
+        change.poly_destination->router() == change.modulation_processor) {
+        connection->source_name.clear();
+        connection->destination_name.clear();
+        return NO;
+    }
+
+    change.num_audio_rate = vitalCountOtherAudioRateConnections(bank, src, dst);
 
     change.modulation_processor->setBaseValue(amount);
     change.modulation_processor->setBipolar(
@@ -443,21 +550,31 @@ static bool vitalLoadFrames(vital::Wavetable *wt, const float *samples, int coun
     if (it == _modConnections.end()) return;
 
     vital::ModulationConnection* connection = it->second;
+    vital::ModulationConnectionBank& bank = _engine->getModulationBank();
+
     vital::modulation_change change;
-    change.source                = _engine->getModulationSource(src);
-    change.mono_destination      = _engine->getMonoModulationDestination(dst);
-    change.mono_modulation_switch= _engine->getMonoModulationSwitch(dst);
+    change.source                 = _engine->getModulationSource(src);
+    change.mono_destination       = _engine->getMonoModulationDestination(dst);
+    change.mono_modulation_switch = _engine->getMonoModulationSwitch(dst);
 
     // Validate BEFORE calling getParameterRange — it asserts on unknown destinations.
     if (change.source && change.mono_destination && change.mono_modulation_switch) {
-        change.poly_modulation_switch= _engine->getPolyModulationSwitch(dst);
-        change.poly_destination      = _engine->getPolyModulationDestination(dst);
-        change.destination_scale     = vital::Parameters::getParameterRange(dst);
-        change.modulation_processor  = connection->modulation_processor.get();
-        change.disconnecting         = true;
-        change.num_audio_rate        = 0;
+        change.poly_modulation_switch = _engine->getPolyModulationSwitch(dst);
+        change.poly_destination       = _engine->getPolyModulationDestination(dst);
+        change.destination_scale      = vital::Parameters::getParameterRange(dst);
+        change.modulation_processor   = connection->modulation_processor.get();
+        change.disconnecting          = true;
+        // Must be computed while the names are still set.
+        change.num_audio_rate         = vitalCountOtherAudioRateConnections(bank, src, dst);
         _engine->disconnectModulation(change);
     }
+
+    // Free the bank slot (ModulationConnectionBank::createConnection only reuses
+    // slots whose source AND destination names are empty). Same as
+    // SynthBase::disconnectModulation. Done even if validation above failed so a
+    // slot can never leak.
+    connection->source_name.clear();
+    connection->destination_name.clear();
     _modConnections.erase(key);
 }
 
@@ -1120,6 +1237,147 @@ static bool vitalLoadFrames(vital::Wavetable *wt, const float *samples, int coun
         wt->loadWaveFrame(&out, f);
     }
     return YES;
+}
+
+// MARK: - Preset modulations / LFOs
+
+- (NSInteger)_applyLFOsFromSettings:(json &)settings {
+    auto it = settings.find("lfos");
+    if (it == settings.end() || !it->is_array()) return 0;
+
+    // The audio thread uses try_lock, so holding _lock here only costs a few
+    // silent blocks while the shapes are replaced.
+    std::lock_guard<std::mutex> lock(_lock);
+    NSInteger loaded = 0;
+    const int count = std::min((int)it->size(), (int)vital::kNumLfos);
+    for (int i = 0; i < count; ++i) {
+        LineGenerator *src = [self _lfoSource:i];
+        if (!src) continue;
+        try {
+            json entry = (*it)[(size_t)i];
+            if (!LineGenerator::isValidJson(entry)) continue;
+            src->jsonToState(entry);
+            src->render();
+            ++loaded;
+        } catch (...) {
+            continue;
+        }
+    }
+    return loaded;
+}
+
+- (NSInteger)_applyModulationsFromSettings:(json &)settings {
+    auto it = settings.find("modulations");
+    if (it == settings.end() || !it->is_array()) return 0;
+
+    // 1. Drop whatever is currently routed (the preset replaces the matrix).
+    //    The public disconnect takes _lock itself, so gather the keys first.
+    std::vector<std::pair<std::string, std::string>> existing;
+    {
+        std::lock_guard<std::mutex> lock(_lock);
+        for (const auto &entry : _modConnections)
+            existing.push_back(entry.first);
+    }
+    for (const auto &key : existing) {
+        [self disconnectModulation:[NSString stringWithUTF8String:key.first.c_str()]
+                              from:[NSString stringWithUTF8String:key.second.c_str()]];
+    }
+
+    // 2. Re-create each connection. Per-slot values live in settings as
+    //    modulation_<slot>_{amount,bipolar,stereo,bypass,power}, where <slot>
+    //    is the entry's position in the preset array (1-based). We read them
+    //    by that preset position, not by whichever bank slot we get back.
+    NSInteger created = 0;
+    const int count = std::min((int)it->size(), (int)vital::kMaxModulationConnections);
+    for (int i = 0; i < count; ++i) {
+        try {
+            json entry = (*it)[(size_t)i];
+            if (!entry.is_object()) continue;
+            std::string srcName = entry.value("source", std::string());
+            std::string dstName = entry.value("destination", std::string());
+            if (srcName.empty() || dstName.empty()) continue;
+
+            const std::string prefix = "modulation_" + std::to_string(i + 1) + "_";
+            NSString *src = [NSString stringWithUTF8String:srcName.c_str()];
+            NSString *dst = [NSString stringWithUTF8String:dstName.c_str()];
+            if (!src || !dst) continue;
+
+            float amount = vitalJsonFloat(settings, prefix + "amount", 0.0f);
+            if (![self connectModulation:src to:dst amount:amount]) continue;
+            ++created;
+
+            if (vitalJsonHasKey(settings, prefix + "bipolar"))
+                [self setModulationBipolar:(vitalJsonFloat(settings, prefix + "bipolar", 0.0f) > 0.5f)
+                                    source:src destination:dst];
+            if (vitalJsonHasKey(settings, prefix + "stereo"))
+                [self setModulationStereo:(vitalJsonFloat(settings, prefix + "stereo", 0.0f) > 0.5f)
+                                   source:src destination:dst];
+            if (vitalJsonHasKey(settings, prefix + "bypass"))
+                [self setModulationBypass:(vitalJsonFloat(settings, prefix + "bypass", 0.0f) > 0.5f)
+                                   source:src destination:dst];
+            if (vitalJsonHasKey(settings, prefix + "power")) {
+                // Preset stores the raw Vital value (±10); the public API takes ±1.
+                float rawPower = vitalJsonFloat(settings, prefix + "power", 0.0f);
+                [self setModulationPower:rawPower / 10.0f source:src destination:dst];
+            }
+        } catch (...) {
+            continue;
+        }
+    }
+    return created;
+}
+
+- (NSInteger)loadModulationsFromPresetJSON:(NSData *)jsonData {
+    json settings;
+    if (!vitalParsePresetSettings(jsonData, settings)) return -1;
+    return [self _applyModulationsFromSettings:settings];
+}
+
+- (NSInteger)loadLFOsFromPresetJSON:(NSData *)jsonData {
+    json settings;
+    if (!vitalParsePresetSettings(jsonData, settings)) return -1;
+    return [self _applyLFOsFromSettings:settings];
+}
+
+- (BOOL)loadModulationsAndLFOsFromPresetJSON:(NSData *)jsonData {
+    json settings;
+    if (!vitalParsePresetSettings(jsonData, settings)) return NO;
+    // LFO shapes first so the sources are final before they get routed.
+    [self _applyLFOsFromSettings:settings];
+    [self _applyModulationsFromSettings:settings];
+    return YES;
+}
+
+// MARK: - Sampler (SMP)
+
+- (BOOL)loadSampleFromSamples:(const float *)samples
+                  sampleCount:(int)sampleCount
+                   sampleRate:(int)sampleRate {
+    if (!samples || sampleCount <= 0 || sampleRate <= 0) return NO;
+
+    // Private, sanitised copy so the caller's buffer can be freed immediately
+    // and NaN/Inf never reach the engine.
+    std::vector<float> data(samples, samples + sampleCount);
+    for (float &v : data)
+        if (!std::isfinite(v)) v = 0.0f;
+
+    try {
+        std::lock_guard<std::mutex> lock(_lock);
+        return vitalLoadSampleIntoEngine(_engine, data.data(), sampleCount,
+                                         sampleRate, _sampleRate) ? YES : NO;
+    } catch (...) {
+        return NO;
+    }
+}
+
+- (BOOL)loadSampleFromData:(NSData *)floatData sampleRate:(int)sampleRate {
+    if (!floatData) return NO;
+    int count = (int)(floatData.length / sizeof(float));
+    if (count <= 0) return NO;
+    // NSData bytes are not guaranteed float-aligned; copy via memcpy.
+    std::vector<float> data(count);
+    memcpy(data.data(), floatData.bytes, (size_t)count * sizeof(float));
+    return [self loadSampleFromSamples:data.data() sampleCount:count sampleRate:sampleRate];
 }
 
 @end
